@@ -88,6 +88,8 @@ A comprehensive loan management system for tracking loans, investor payments, an
 
 ## 🔧 Installation & Setup
 
+> **⚠️ Important Notice**: This system currently has known data quality issues including duplicate records, missing contact information, and status classification problems. Please review the [Known Issues](#️-known-issues--current-limitations) section before proceeding with installation.
+
 ### 1. Clone the Repository
 ```bash
 git clone https://github.com/yourusername/goodland-lms.git
@@ -741,6 +743,95 @@ npm test
 - **Response Time**: < 500ms for most API endpoints
 - **Memory Usage**: ~50MB for backend, ~100MB for frontend
 
+## ⚠️ Known Issues & Current Limitations
+
+### Data Quality Issues
+
+1. **Dirty Data - Duplicates & Anomalies**
+   - **Problem**: The database contains duplicate project records and anomalous interest payment data
+   - **Impact**: Some loans may appear multiple times with different amounts or payment statuses
+   - **Detection**: System logs duplicate project names and unusual payment completion percentages
+   - **Mitigation**: Debug endpoints available at `/api/debug/duplicates/{projectName}` to identify issues
+   - **Example**: Projects with same name but different stage IDs and payment amounts
+
+2. **Email & Phone Data Gaps**
+   - **Problem**: Many investor records have null email addresses and phone numbers
+   - **Impact**: Payment reminder system cannot send notifications to all investors
+   - **Affected Function**: `/api/reminders/investors` returns incomplete contact information
+   - **Current Behavior**: System continues to generate reminders but marks contact info as unavailable
+   - **Required Fix**: Data cleanup to populate missing contact information
+
+3. **Status Classification Issues**
+   - **Problem**: 3+ loan records incorrectly marked as 'overdue' due to status logic conflicts
+   - **Root Cause**: The 'operating' term filtering is not working properly for certain edge cases
+   - **Impact**: False alarms in loan status reports and cashflow predictions
+   - **Affected Logic**: Special project handling (IDs 59, 55, 51) vs normal loan status calculations
+   - **Debug Tools**: Use `/api/debug/loans/{projectTitle}` to investigate specific cases
+
+### System Limitations
+
+4. **Interest Calculation Edge Cases**
+   - **Partial Month Proration**: May have rounding errors for contracts starting/ending mid-month
+   - **Special Projects**: Projects 59, 55, 51 have hardcoded business rules that may not apply universally
+   - **Payment Tolerance**: 1% tolerance for payment completion may be too strict/loose for some cases
+
+5. **Performance Considerations**
+   - **Large Data Sets**: Cashflow predictions may be slow with 100+ active loans
+   - **Database Queries**: Some queries use subqueries instead of JOINs for payment aggregation
+   - **Memory Usage**: Frontend may consume significant memory when displaying all loan details
+
+6. **Business Logic Assumptions**
+   - **Upfront Payment Model**: System assumes all borrower interest is paid upfront
+   - **Fixed Rate Calculations**: No support for variable interest rates or rate changes
+   - **Currency**: All calculations assume AUD with no multi-currency support
+
+## 🔧 Data Cleanup Recommendations
+
+### Immediate Actions Required
+
+1. **Duplicate Data Cleanup**
+   ```sql
+   -- Identify duplicate projects
+   SELECT name, COUNT(*) as count 
+   FROM project 
+   GROUP BY name 
+   HAVING COUNT(*) > 1;
+   
+   -- Review duplicate loan stages
+   SELECT project_id, COUNT(*) as loan_count, SUM(loan_amount) as total_amount
+   FROM stage 
+   WHERE status IN ('operating', 'performing')
+   GROUP BY project_id 
+   HAVING COUNT(*) > 1;
+   ```
+
+2. **Contact Information Update**
+   ```sql
+   -- Find investors with missing contact info
+   SELECT id, name, email, phone 
+   FROM account 
+   WHERE (email IS NULL OR email = '') 
+      OR (phone IS NULL OR phone = '');
+   ```
+
+3. **Status Logic Audit**
+   ```sql
+   -- Review potentially misclassified loans
+   SELECT s.id, p.name, s.status, s.loan_repayment_date, s.loan_expiry_date
+   FROM stage s 
+   JOIN project p ON s.project_id = p.id
+   WHERE s.status = 'operating' 
+     AND s.loan_repayment_date < CURDATE()
+     AND p.id NOT IN (59, 55, 51);
+   ```
+
+### Development Priorities
+
+1. **Data Validation Layer**: Add checks for duplicate prevention and data integrity
+2. **Contact Information Validation**: Require email/phone for investor registration
+3. **Status Logic Refactoring**: Simplify and standardize loan status calculations
+4. **Automated Data Quality Reports**: Daily checks for data inconsistencies
+
 ## 🔍 Troubleshooting
 
 ### Common Issues
@@ -765,6 +856,16 @@ npm test
    - Check Node.js version compatibility
    - Verify all dependencies are installed
 
+5. **Incorrect Loan Status or Payment Data**
+   - Use debug endpoints to investigate: `/api/debug/loans/{projectTitle}`
+   - Check for duplicate records: `/api/debug/duplicates/{projectName}`
+   - Verify payment synchronization: `/api/debug/payment-sync/{projectName}`
+
+6. **Missing Reminder Notifications**
+   - Check investor contact information in database
+   - Verify email/phone fields are populated
+   - Review reminder generation logs in console output
+
 ## 📞 Support
 
 For issues and questions:
@@ -787,8 +888,77 @@ For issues and questions:
 - Check database query performance
 - Review memory usage patterns
 
+## 📋 Changelog & Development Notes
+
+### Version 2.1.0 (Current) - 2025-07-01
+**Status**: Development with Known Issues
+
+**New Features:**
+- Enhanced cashflow predictions with NET vs GROSS calculations
+- Comprehensive tax and fee tracking
+- Payment analysis with collection rates
+- Actual payment data integration instead of theoretical calculations
+
+**Known Issues Documented:**
+- Dirty data: Duplicate projects and anomalous payment records
+- Missing contact information affecting reminder system
+- Status classification issues with 3+ loans incorrectly marked as overdue
+- Performance considerations with large datasets
+
+**Debug Tools Added:**
+- `/api/debug/duplicates/{projectName}` - Identify duplicate records
+- `/api/debug/loans/{projectTitle}` - Investigate loan calculations  
+- `/api/debug/payment-sync/{projectName}` - Payment synchronization issues
+
+### Version 2.0.0 - 2025-06-30
+**Status**: Stable
+
+**Major Changes:**
+- Implemented upfront interest payment model
+- Added special project handling (IDs 59, 55, 51)
+- Modular backend architecture
+- Payment completion percentage calculations
+- Daily proration for partial months
+
+### Version 1.0.0 - Initial Release
+**Status**: Legacy
+
+**Features:**
+- Basic loan management
+- Simple payment tracking
+- Basic investor reminders
+
+## 🎯 Development Roadmap
+
+### Phase 1: Data Quality (Priority: High)
+- [ ] Implement duplicate detection and prevention
+- [ ] Data cleanup procedures for existing records
+- [ ] Contact information validation layer
+- [ ] Automated data quality reports
+
+### Phase 2: System Reliability (Priority: High)  
+- [ ] Fix loan status classification logic
+- [ ] Improve special project handling
+- [ ] Performance optimization for large datasets
+- [ ] Enhanced error handling and logging
+
+### Phase 3: Feature Enhancements (Priority: Medium)
+- [ ] Multi-currency support
+- [ ] Variable interest rate handling
+- [ ] Advanced reporting and analytics
+- [ ] Email notification system integration
+
+### Phase 4: User Experience (Priority: Low)
+- [ ] Advanced filtering and search
+- [ ] Export functionality
+- [ ] Mobile-responsive improvements
+- [ ] User role management
+
 ---
 
-**Version**: 2.0.0  
+**Version**: 2.1.0-dev  
+**Status**: Development with Known Issues  
 **Last Updated**: 2025-07-01  
-**Maintainer**: Dylan (Goodland Team) 
+**Maintainer**: Dylan (Goodland Team)  
+
+**⚠️ Production Notice**: This system contains known data quality issues. Review the "Known Issues" section before deploying to production environments. 
