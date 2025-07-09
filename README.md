@@ -137,6 +137,492 @@ The application will be available at:
 - `GET /api/debug/payment-sync/:projectName` - Investigate payment synchronization
 - `GET /api/debug/prorated-payments/:stageId/:investorId` - Test prorated calculations
 
+## 🔧 Backend Architecture & Functions
+
+### Server Architecture (`backend/server.js`)
+
+The main server file sets up Express.js with modular routing:
+
+```javascript
+const express = require('express');
+const cors = require('cors');
+
+// Import route modules
+const loansRoutes = require('./src/routes/loans');
+const remindersRoutes = require('./src/routes/reminders');
+const cashflowRoutes = require('./src/routes/cashflow');
+const debugRoutes = require('./src/routes/debug');
+
+const app = express();
+const PORT = process.env.PORT || 3001;
+
+// Middleware setup
+app.use(express.json({ limit: '10mb' }));
+app.use(cors(corsOptions));
+
+// Route registration
+app.use('/api/loans', loansRoutes);
+app.use('/api/reminders', remindersRoutes);
+app.use('/api/cashflow', cashflowRoutes);
+app.use('/api/debug', debugRoutes);
+```
+
+### Database Connection (`backend/src/database/connection.js`)
+
+Manages MySQL connection with connection pooling:
+
+```javascript
+const mysql = require('mysql2/promise');
+
+const pool = mysql.createPool({
+  host: process.env.DB_HOST || 'localhost',
+  user: process.env.DB_USER || 'root',
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME || 'goodland_lms',
+  port: process.env.DB_PORT || 3306,
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0
+});
+
+// Wrapper function for database queries
+const query = async (sql, params = []) => {
+  try {
+    const [rows] = await pool.execute(sql, params);
+    return rows;
+  } catch (error) {
+    console.error('Database query error:', error);
+    throw error;
+  }
+};
+```
+
+## 🧮 Core Calculation Functions (`backend/src/utils/calculations.js`)
+
+### `calculateUpfrontInterest(loanAmount, borrowerRate, startDate, endDate)`
+
+Calculates the exact upfront interest amount using proper daily proration:
+
+```javascript
+function calculateUpfrontInterest(loanAmount, borrowerRate, startDate, endDate) {
+  const period = calculateContractPeriod(startDate, endDate);
+  
+  // Monthly interest rate (borrowerRate is decimal: 0.1085 for 10.85%)
+  const monthlyRate = borrowerRate / 12;
+  
+  // Interest for full months
+  const fullMonthsInterest = monthlyRate * period.fullMonths * loanAmount;
+  
+  // Interest for partial month (if any) with daily proration
+  let partialMonthInterest = 0;
+  if (period.remainingDays > 0) {
+    const dailyRate = monthlyRate / period.daysInLastMonth;
+    partialMonthInterest = dailyRate * period.remainingDays * loanAmount;
+  }
+  
+  return {
+    fullMonthsInterest,
+    partialMonthInterest,
+    totalInterest: fullMonthsInterest + partialMonthInterest,
+    period
+  };
+}
+```
+
+**How it works:**
+1. **Full Months**: Calculates complete months between start and end dates
+2. **Partial Month**: Handles remaining days with daily proration
+3. **Daily Rate**: Uses actual days in the last month for accuracy
+4. **Returns**: Detailed breakdown of interest calculation
+
+### `calculateContractPeriod(startDate, endDate)`
+
+Precisely calculates loan contract periods:
+
+```javascript
+function calculateContractPeriod(startDate, endDate) {
+  const start = new Date(startDate);
+  const end = new Date(endDate);
+  
+  // Calculate full months by iterating month by month
+  let fullMonths = 0;
+  let currentDate = new Date(start);
+  
+  while (currentDate < end) {
+    const nextMonth = new Date(currentDate);
+    nextMonth.setMonth(nextMonth.getMonth() + 1);
+    
+    if (nextMonth <= end) {
+      fullMonths++;
+      currentDate = nextMonth;
+    } else {
+      break;
+    }
+  }
+  
+  // Calculate remaining days in partial month
+  const remainingDays = Math.ceil((end - currentDate) / (1000 * 60 * 60 * 24));
+  const daysInLastMonth = new Date(currentDate.getFullYear(), currentDate.getMonth() + 1, 0).getDate();
+  
+  return {
+    fullMonths,
+    remainingDays,
+    daysInLastMonth,
+    totalDays: Math.ceil((end - start) / (1000 * 60 * 60 * 24))
+  };
+}
+```
+
+### `getUpfrontInterestStatus(expectedInterest, actualPaidAmount, contractStartDate, projectId)`
+
+Determines payment status based on upfront payment model:
+
+```javascript
+function getUpfrontInterestStatus(expectedInterest, actualPaidAmount, contractStartDate, projectId, repaymentDate, expiryDate) {
+  const currentDate = new Date();
+  const startDate = new Date(contractStartDate);
+  
+  // If contract hasn't started yet, interest is pending
+  if (currentDate < startDate) {
+    return 'pending';
+  }
+  
+  // Contract has started - interest should have been paid upfront
+  if (!actualPaidAmount || actualPaidAmount === 0) {
+    return 'overdue'; // Should have been paid upfront
+  }
+  
+  // Check if payment amount is sufficient (with 1% tolerance for rounding)
+  const tolerance = expectedInterest * 0.01;
+  const sufficientPayment = actualPaidAmount >= (expectedInterest - tolerance);
+  
+  return sufficientPayment ? 'paid' : 'partial';
+}
+```
+
+## 🛣️ Route Handlers Detailed Explanation
+
+### Loans Route (`backend/src/routes/loans.js`)
+
+#### `GET /api/loans` - Main loan data endpoint
+
+**Purpose**: Retrieves all active loans with calculated statuses and payment information
+
+**Database Query**:
+```sql
+SELECT 
+  s.id,
+  s.loan_amount,
+  s.interest_rate as borrower_interest_rate,
+  s.default_rate,
+  s.loan_start_date,
+  s.loan_repayment_date,
+  s.loan_expiry_date,
+  s.status,
+  p.name as project_title,
+  p.status as project_status,
+  p.id as project_id,
+  DATEDIFF(s.loan_repayment_date, CURDATE()) as days_to_maturity,
+  DATEDIFF(s.loan_start_date, CURDATE()) as days_to_start,
+  (SELECT SUM(ii.money) FROM invest_interest ii WHERE ii.stage_id = s.id) as total_interest_paid,
+  (SELECT MAX(ii.date) FROM invest_interest ii WHERE ii.stage_id = s.id) as last_payment_date,
+  (SELECT COUNT(ii.id) FROM invest_interest ii WHERE ii.stage_id = s.id) as payment_count
+FROM stage s
+LEFT JOIN project p ON s.project_id = p.id
+WHERE s.status IN ('operating', 'performing')
+  AND (p.id IN (59, 55, 51) OR s.loan_repayment_date >= CURDATE())
+```
+
+**Processing Logic**:
+1. **Calculate Expected Interest**: Uses `calculateUpfrontInterest()` with actual contract dates
+2. **Determine Interest Status**: Compares actual payments vs expected using `getUpfrontInterestStatus()`
+3. **Calculate Loan Status**: Uses `getLoanStatus()` with special project handling
+4. **Format Response**: Converts decimals to percentages, adds compatibility fields
+
+**Response Processing**:
+```javascript
+const processedLoans = loans.map(loan => {
+  // Calculate expected upfront interest amount using borrower's rate
+  const expectedInterest = calculateUpfrontInterest(
+    parseFloat(loan.loan_amount),
+    loan.borrower_interest_rate, // Raw decimal from DB (e.g., 0.1085)
+    loan.loan_start_date,
+    loan.loan_repayment_date
+  );
+  
+  // Determine interest payment status (upfront model)
+  const actualPaidAmount = parseFloat(loan.total_interest_paid || 0);
+  const interestStatus = getUpfrontInterestStatus(
+    expectedInterest.totalInterest,
+    actualPaidAmount,
+    loan.loan_start_date,
+    loan.project_id,
+    loan.loan_repayment_date,
+    loan.loan_expiry_date
+  );
+  
+  return {
+    ...loan,
+    // Convert decimals to percentages for frontend
+    borrower_interest_rate: loan.borrower_interest_rate * 100,
+    default_rate: loan.default_rate * 100,
+    
+    // Interest calculation details
+    expected_total_interest: Math.round(expectedInterest.totalInterest * 100) / 100,
+    expected_full_months_interest: Math.round(expectedInterest.fullMonthsInterest * 100) / 100,
+    expected_partial_month_interest: Math.round(expectedInterest.partialMonthInterest * 100) / 100,
+    
+    // Payment status
+    total_interest_paid: actualPaidAmount,
+    interest_status: interestStatus,
+    loan_status: loanStatus,
+    payment_completion: loan.total_interest_paid ? 
+      Math.round((actualPaidAmount / expectedInterest.totalInterest) * 100) : 0
+  };
+});
+```
+
+### Cashflow Route (`backend/src/routes/cashflow.js`)
+
+#### `GET /api/cashflow/monthly` - Cashflow predictions
+
+**Purpose**: Generates monthly cashflow predictions based on actual payment data
+
+**Enhanced Database Query**:
+```sql
+SELECT 
+  s.id,
+  s.loan_amount,
+  s.interest_rate as borrower_interest_rate,
+  s.loan_start_date,
+  s.loan_repayment_date,
+  s.loan_expiry_date,
+  p.name as project_title,
+  p.id as project_id,
+  COALESCE(payment_summary.total_interest_paid, 0) as total_interest_paid,
+  COALESCE(payment_summary.payment_count, 0) as payment_count,
+  payment_summary.last_payment_date
+FROM stage s
+LEFT JOIN project p ON s.project_id = p.id
+LEFT JOIN (
+  SELECT 
+    stage_id,
+    SUM(money) as total_interest_paid,
+    COUNT(*) as payment_count,
+    MAX(date) as last_payment_date
+  FROM invest_interest 
+  GROUP BY stage_id
+) payment_summary ON s.id = payment_summary.stage_id
+WHERE s.status IN ('operating', 'performing')
+  AND (p.id IN (59, 55, 51) OR s.loan_repayment_date >= CURDATE())
+```
+
+**Loan Data Pre-processing**:
+```javascript
+const loanData = activeLoans.map(loan => {
+  // Calculate proper expected upfront interest
+  const expectedInterest = calculateUpfrontInterest(
+    parseFloat(loan.loan_amount),
+    loan.borrower_interest_rate,
+    loan.loan_start_date,
+    loan.loan_repayment_date
+  );
+  
+  // Use actual payment amount (what borrower actually paid)
+  const actualPaidAmount = parseFloat(loan.total_interest_paid || 0);
+  
+  // Calculate loan term in months for spreading the income
+  const loanStartDate = new Date(loan.loan_start_date);
+  const loanEndDate = new Date(loan.loan_repayment_date);
+  const totalDays = Math.ceil((loanEndDate - loanStartDate) / (1000 * 60 * 60 * 24));
+  const approximateMonths = Math.max(1, Math.round(totalDays / 30));
+  
+  // Calculate monthly income based on actual payments
+  const monthlyIncomeFromActualPayments = actualPaidAmount / approximateMonths;
+  
+  return {
+    ...loan,
+    expectedInterest: expectedInterest.totalInterest,
+    actualPaidAmount,
+    approximateMonths,
+    monthlyIncomeFromActualPayments,
+    loanStartDate,
+    loanEndDate,
+    contractPeriod: expectedInterest.period
+  };
+});
+```
+
+**Monthly Prediction Logic**:
+```javascript
+for (let i = 0; i < months; i++) {
+  const targetDate = new Date();
+  targetDate.setMonth(targetDate.getMonth() + i);
+  const monthStart = new Date(targetDate.getFullYear(), targetDate.getMonth(), 1);
+  const monthEnd = new Date(targetDate.getFullYear(), targetDate.getMonth() + 1, 0);
+  
+  // Calculate monthly interest income based on actual payments spread over loan term
+  for (const loan of loanData) {
+    // Check if loan is active during this month
+    if (loan.loanStartDate <= monthEnd && loan.loanEndDate >= monthStart) {
+      // Only include income if borrower actually made payments
+      if (loan.actualPaidAmount > 0) {
+        monthData.totalInterestReceivable += loan.monthlyIncomeFromActualPayments;
+        monthData.interestPayments.push({
+          stageId: loan.id,
+          projectTitle: loan.project_title,
+          amount: loan.monthlyIncomeFromActualPayments,
+          type: 'actual_monthly_income',
+          actualPaid: loan.actualPaidAmount,
+          expectedTotal: loan.expectedInterest,
+          paymentStatus: loan.actualPaidAmount >= loan.expectedInterest * 0.99 ? 'fully_paid' : 'partial_paid'
+        });
+      }
+    }
+  }
+}
+```
+
+### Reminders Route (`backend/src/routes/reminders.js`)
+
+#### `GET /api/reminders` - Payment reminders
+
+**Purpose**: Generates upcoming payment reminders for borrowers
+
+**Key Logic**:
+```javascript
+for (const loan of activeLoans) {
+  const loanStartDate = new Date(loan.loan_start_date);
+  const principalDate = new Date(loan.loan_repayment_date);
+  
+  // Check for upcoming contract start dates (upfront interest due)
+  const daysToStart = Math.ceil((loanStartDate - currentDate) / (1000 * 60 * 60 * 24));
+  
+  if (daysToStart <= 14 && daysToStart >= 0) {
+    // Calculate expected upfront interest
+    const upfrontInterest = calculateUpfrontInterest(
+      parseFloat(loan.loan_amount),
+      loan.borrower_interest_rate,
+      loan.loan_start_date,
+      loan.loan_repayment_date
+    );
+    
+    reminders.push({
+      id: loan.id,
+      projectTitle: loan.project_title || 'Unknown Project',
+      loanAmount: loan.loan_amount,
+      expectedInterest: Math.round(upfrontInterest.totalInterest * 100) / 100,
+      dueDate: loanStartDate.toISOString().slice(0, 10),
+      daysUntilDue: daysToStart,
+      urgencyLevel: daysToStart <= 7 ? 'urgent' : 'upcoming',
+      reminderType: 'upfront_interest',
+      status: 'upcoming'
+    });
+  }
+}
+```
+
+#### `GET /api/reminders/investors` - Investor payment reminders
+
+**Purpose**: Generates investor payment schedules with prorated calculations
+
+**Complex Prorated Payment Logic**:
+```javascript
+// Calculate prorated payments for investors
+const generatePaymentSchedule = (basePaymentDate, endDate, predictionEndDate, hasLastPayment = false) => {
+  const payments = [];
+  let currentPaymentDate = new Date(basePaymentDate);
+  
+  // If we have a last payment date, calculate the next payment first
+  if (hasLastPayment) {
+    // Next payment = last payment + 1 month - 1 day
+    currentPaymentDate.setMonth(currentPaymentDate.getMonth() + 1);
+    currentPaymentDate.setDate(currentPaymentDate.getDate() - 1);
+  }
+  
+  // Generate all future payments
+  while (currentPaymentDate <= new Date(endDate) && currentPaymentDate <= predictionEndDate) {
+    if (currentPaymentDate >= new Date()) {
+      payments.push(new Date(currentPaymentDate));
+    }
+    
+    // Calculate next payment date
+    currentPaymentDate.setMonth(currentPaymentDate.getMonth() + 1);
+    currentPaymentDate.setDate(currentPaymentDate.getDate() - 1);
+  }
+  
+  return payments;
+};
+```
+
+## 🔍 Special Business Logic
+
+### Special Project Handling (Projects 59, 55, 51)
+
+These projects have unique business rules:
+
+```javascript
+function getLoanStatus(projectId, loanStartDate, loanEndDate, daysToMaturity, expiryDate) {
+  // Special handling for projects 59, 55, 51
+  if ([59, 55, 51].includes(projectId)) {
+    const currentDate = new Date();
+    const endDate = new Date(loanEndDate);
+    const expireDate = new Date(expiryDate);
+    
+    // Scenario 1: If end date (repayment date) is past today
+    if (endDate < currentDate) {
+      return 'overdue';
+    }
+    
+    // Scenario 2: If expire date is past the repayment date
+    if (expireDate < endDate) {
+      return 'overdue-extension';
+    }
+  }
+  
+  // Normal logic for other projects...
+}
+```
+
+### Payment Completion Accuracy
+
+The system uses a 1% tolerance for payment completion to handle rounding:
+
+```javascript
+// Check if payment amount is sufficient (with 1% tolerance for rounding)
+const tolerance = expectedInterest * 0.01;
+const sufficientPayment = actualPaidAmount >= (expectedInterest - tolerance);
+
+// Frontend display logic
+const formatPaymentCompletion = (completion) => {
+  const percentage = completion || 0;
+  // If payment is more than 99.9%, show 100%
+  return percentage > 99.9 ? 100 : Math.round(percentage * 100) / 100;
+};
+```
+
+### Database Query Optimization
+
+The system uses efficient SQL with subqueries and JOINs:
+
+```sql
+-- Optimized query with payment aggregation
+LEFT JOIN (
+  SELECT 
+    stage_id,
+    SUM(money) as total_interest_paid,
+    COUNT(*) as payment_count,
+    MAX(date) as last_payment_date
+  FROM invest_interest 
+  GROUP BY stage_id
+) payment_summary ON s.id = payment_summary.stage_id
+```
+
+This approach:
+- **Reduces Database Calls**: Aggregates payment data in a single query
+- **Improves Performance**: Uses indexed foreign keys
+- **Maintains Accuracy**: Preserves exact payment amounts and dates
+
 ## 🗄️ Database Structure
 
 The system uses MySQL with these main tables:
@@ -305,4 +791,4 @@ For issues and questions:
 
 **Version**: 2.0.0  
 **Last Updated**: 2025-07-01  
-**Maintainer**: Dylan (Goodland Team)
+**Maintainer**: Dylan (Goodland Team) 
