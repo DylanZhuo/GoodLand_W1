@@ -15,17 +15,12 @@ yarn-error.log*
 backend/.env
 frontend/.env
 
-# Database backups with real data (NEVER commit these!)
-database/goodland_*_mysql_data.sql
-database/*_backup.sql
-database/*_dump.sql
-cleanup_old_reminders.sql
-
-# Allow these database files for GitHub (schema/setup only)
-!database/init-scripts/
-!database/init-scripts/*.sql
+# Database backups with real data (keep schema only)
+*.sql
 !database/schema.sql
-!database/migrations/
+!database/init-scripts/
+database/goodland_2025-06-30_02-30-02_mysql_data.sql
+
 # Logs
 logs/
 *.log
@@ -39,7 +34,7 @@ pids/
 # Build outputs
 build/
 dist/
-frontend/build/
+
 
 # IDE files
 .vscode/
