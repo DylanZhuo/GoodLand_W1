@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../database/connection');
-const { calculateUpfrontInterest } = require('../utils/calculations');
+const { calculateUpfrontInterest, generatePaymentSchedule, calculateBasePaymentDate } = require('../utils/calculations');
 
 // Get monthly cashflow data with prediction
 router.get('/monthly', async (req, res) => {
@@ -82,16 +82,29 @@ router.get('/monthly', async (req, res) => {
       const totalTaxPaid = parseFloat(loan.total_tax_paid || 0);
       const totalFeesPaid = parseFloat(loan.total_fees_paid || 0);
       
-      // Calculate loan term in months for spreading the income
       const loanStartDate = new Date(loan.loan_start_date);
       const loanEndDate = new Date(loan.loan_repayment_date);
-      const totalDays = Math.ceil((loanEndDate - loanStartDate) / (1000 * 60 * 60 * 24));
-      const approximateMonths = Math.max(1, Math.round(totalDays / 30)); // Ensure at least 1 month
       
-      // Calculate monthly income based on NET payments (actual cash received)
-      const monthlyIncomeFromActualPayments = actualPaidNet / approximateMonths;
-      const monthlyTaxFromActualPayments = totalTaxPaid / approximateMonths;
-      const monthlyFeesFromActualPayments = totalFeesPaid / approximateMonths;
+      // Generate payment schedule for borrower interest income (same logic as investors)
+      const predictionEndDate = new Date();
+      predictionEndDate.setMonth(predictionEndDate.getMonth() + months);
+      
+      const basePaymentDate = calculateBasePaymentDate(
+        loan.last_payment_date,
+        loan.loan_start_date,
+        null // No transaction date for borrowers
+      );
+      
+      const borrowerPaymentSchedule = generatePaymentSchedule(
+        basePaymentDate,
+        loan.loan_repayment_date,
+        predictionEndDate,
+        !!loan.last_payment_date
+      );
+      
+      // Calculate monthly interest rate for borrower
+      const borrowerMonthlyRate = parseFloat(loan.borrower_interest_rate) / 12;
+      const loanAmount = parseFloat(loan.loan_amount);
       
       return {
         ...loan,
@@ -100,13 +113,12 @@ router.get('/monthly', async (req, res) => {
         actualPaidNet,
         totalTaxPaid,
         totalFeesPaid,
-        approximateMonths,
-        monthlyIncomeFromActualPayments,
-        monthlyTaxFromActualPayments,
-        monthlyFeesFromActualPayments,
         loanStartDate,
         loanEndDate,
-        contractPeriod: expectedInterest.period
+        contractPeriod: expectedInterest.period,
+        borrowerPaymentSchedule,
+        borrowerMonthlyRate,
+        loanAmount
       };
     });
 
@@ -139,30 +151,85 @@ router.get('/monthly', async (req, res) => {
         investorPayouts: []
       };
 
-      // Calculate monthly interest income based on actual payments spread over loan term
+      // Calculate monthly interest income based on payment schedule (same logic as investors)
       for (const loan of loanData) {
         // Check if loan is active during this month
         if (loan.loanStartDate <= monthEnd && loan.loanEndDate >= monthStart) {
           // Only include income if borrower actually made payments
           if (loan.actualPaidNet > 0) {
-            monthData.totalInterestReceivable += loan.monthlyIncomeFromActualPayments;
-            monthData.totalTaxes += loan.monthlyTaxFromActualPayments;
-            monthData.totalFees += loan.monthlyFeesFromActualPayments;
-            monthData.interestPayments.push({
-              stageId: loan.id,
-              projectTitle: loan.project_title,
-              netAmount: loan.monthlyIncomeFromActualPayments,
-              grossAmount: loan.actualPaidGross / loan.approximateMonths,
-              taxAmount: loan.monthlyTaxFromActualPayments,
-              feeAmount: loan.monthlyFeesFromActualPayments,
-              type: 'actual_monthly_income',
-              actualPaidGross: loan.actualPaidGross,
-              actualPaidNet: loan.actualPaidNet,
-              totalTaxes: loan.totalTaxPaid,
-              totalFees: loan.totalFeesPaid,
-              expectedTotal: loan.expectedInterest,
-              paymentStatus: loan.actualPaidNet >= loan.expectedInterest * 0.99 ? 'fully_paid' : 'partial_paid'
-            });
+            // Check if this month has a scheduled payment for the borrower
+            const hasPaymentThisMonth = loan.borrowerPaymentSchedule.some(paymentDate => 
+              paymentDate >= monthStart && paymentDate <= monthEnd
+            );
+            
+            if (hasPaymentThisMonth) {
+              // Calculate payment amount using the same logic as investors
+              let monthlyInterestAmount = loan.loanAmount * loan.borrowerMonthlyRate;
+              
+              // Check if this is the final month and needs prorating
+              const isLastMonth = loan.loanEndDate >= monthStart && loan.loanEndDate <= monthEnd;
+              
+              if (isLastMonth) {
+                // Calculate prorated amount for final month
+                const finalPaymentDate = loan.borrowerPaymentSchedule.find(paymentDate => 
+                  paymentDate >= monthStart && paymentDate <= monthEnd
+                );
+                
+                if (finalPaymentDate) {
+                  const daysInMonth = new Date(monthEnd.getFullYear(), monthEnd.getMonth() + 1, 0).getDate();
+                  const actualDaysInMonth = Math.min(
+                    Math.ceil((loan.loanEndDate - monthStart) / (1000 * 60 * 60 * 24)),
+                    daysInMonth
+                  );
+                  
+                  // Prorate: ((borrower's annual rate / 12) / (days in month)) * actual days
+                  const dailyRate = loan.borrowerMonthlyRate / daysInMonth;
+                  monthlyInterestAmount = loan.loanAmount * dailyRate * actualDaysInMonth;
+                  
+                  console.log(`📅 Prorated final month interest for loan ${loan.id}:`);
+                  console.log(`   Monthly rate: ${loan.borrowerMonthlyRate.toFixed(6)}`);
+                  console.log(`   Days in month: ${daysInMonth}`);
+                  console.log(`   Actual days in month: ${actualDaysInMonth}`);
+                  console.log(`   Daily rate: ${dailyRate.toFixed(8)}`);
+                  console.log(`   Standard monthly: $${(loan.loanAmount * loan.borrowerMonthlyRate).toFixed(2)}`);
+                  console.log(`   Prorated amount: $${monthlyInterestAmount.toFixed(2)}`);
+                }
+              }
+              
+              // Calculate proportional amounts for taxes and fees based on actual payments
+              const grossToNetRatio = loan.actualPaidNet / (loan.actualPaidGross || 1);
+              const taxRatio = loan.totalTaxPaid / (loan.actualPaidGross || 1);
+              const feeRatio = loan.totalFeesPaid / (loan.actualPaidGross || 1);
+              
+              const grossAmount = monthlyInterestAmount;
+              const netAmount = grossAmount * grossToNetRatio;
+              const taxAmount = grossAmount * taxRatio;
+              const feeAmount = grossAmount * feeRatio;
+              
+              monthData.totalInterestReceivable += netAmount;
+              monthData.totalTaxes += taxAmount;
+              monthData.totalFees += feeAmount;
+              
+              monthData.interestPayments.push({
+                stageId: loan.id,
+                projectTitle: loan.project_title,
+                netAmount: netAmount,
+                grossAmount: grossAmount,
+                taxAmount: taxAmount,
+                feeAmount: feeAmount,
+                type: 'scheduled_monthly_income',
+                actualPaidGross: loan.actualPaidGross,
+                actualPaidNet: loan.actualPaidNet,
+                totalTaxes: loan.totalTaxPaid,
+                totalFees: loan.totalFeesPaid,
+                expectedTotal: loan.expectedInterest,
+                paymentStatus: loan.actualPaidNet >= loan.expectedInterest * 0.99 ? 'fully_paid' : 'partial_paid',
+                isProrated: isLastMonth,
+                scheduledPaymentDate: loan.borrowerPaymentSchedule.find(paymentDate => 
+                  paymentDate >= monthStart && paymentDate <= monthEnd
+                )?.toISOString().slice(0, 10)
+              });
+            }
           }
         }
         
@@ -188,12 +255,21 @@ router.get('/monthly', async (req, res) => {
           const monthlyRate = parseFloat(investor.investor_rate) / 12;
           const monthlyPayment = parseFloat(investor.investment_amount) * monthlyRate;
           
-          monthData.totalInvestorPayouts += monthlyPayment;
+          const investorName = investor.investor_name || `Investor ${investor.investor_id}`;
+          const isGoodlandInvestor = investorName.toLowerCase().includes('goodland');
+          
+          // Only add to cash outflows if not a Goodland investor
+          if (!isGoodlandInvestor) {
+            monthData.totalInvestorPayouts += monthlyPayment;
+          }
+          
           monthData.investorPayouts.push({
             investorId: investor.investor_id,
-            investorName: investor.investor_name || `Investor ${investor.investor_id}`,
+            investorName: investorName,
             stageId: investor.stage_id,
-            amount: monthlyPayment
+            amount: monthlyPayment,
+            isGoodlandInvestor: isGoodlandInvestor,
+            excludedFromOutflows: isGoodlandInvestor
           });
         }
       }
