@@ -215,6 +215,7 @@ function CashFlowTab() {
                   <Typography variant="body2" color="textSecondary">
                     Investor Payouts: {formatCurrency(month.totalInvestorPayouts)}
                   </Typography>
+                  
                   <Typography variant="body2" fontWeight="bold" color="error.main">
                     Total Out: {formatCurrency(month.totalInvestorPayouts)}
                   </Typography>
