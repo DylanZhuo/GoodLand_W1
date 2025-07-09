@@ -2,9 +2,10 @@
 
 ## 1. 使用说明-数据库说明
 
+- 所有数据均需要在本地 MySQL Workbench 中导入使用。
 - 所有数据库相关文件都位于 `database/` 目录中。
 - `schema.sql` 是清洗过脏数据之后的数据库结构与数据。
-- `goodland_2025-06-30_02-30-02_mysql_data.sql` 是原始数据库数据，需要在本地 MySQL Workbench 中导入使用。
+- `goodland_2025-06-30_02-30-02_mysql_data.sql` 是原始数据库数据
 
 ## 2. 使用说明-前端说明
 - 运行前端之前请运行：npm install安装相关插件。
