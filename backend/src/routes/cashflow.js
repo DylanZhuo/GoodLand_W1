@@ -21,7 +21,10 @@ router.get('/monthly', async (req, res) => {
         s.loan_expiry_date,
         p.name as project_title,
         p.id as project_id,
-        COALESCE(payment_summary.total_interest_paid, 0) as total_interest_paid,
+        COALESCE(payment_summary.total_interest_paid_gross, 0) as total_interest_paid_gross,
+        COALESCE(payment_summary.total_interest_paid_net, 0) as total_interest_paid_net,
+        COALESCE(payment_summary.total_tax_paid, 0) as total_tax_paid,
+        COALESCE(payment_summary.total_fees_paid, 0) as total_fees_paid,
         COALESCE(payment_summary.payment_count, 0) as payment_count,
         payment_summary.last_payment_date
       FROM stage s
@@ -29,7 +32,10 @@ router.get('/monthly', async (req, res) => {
       LEFT JOIN (
         SELECT 
           stage_id,
-          SUM(money) as total_interest_paid,
+          SUM(money) as total_interest_paid_gross,
+          SUM(net) as total_interest_paid_net,
+          SUM(tax) as total_tax_paid,
+          SUM(fee) as total_fees_paid,
           COUNT(*) as payment_count,
           MAX(date) as last_payment_date
         FROM invest_interest 
@@ -70,8 +76,11 @@ router.get('/monthly', async (req, res) => {
         loan.loan_repayment_date
       );
       
-      // Use actual payment amount (what borrower actually paid)
-      const actualPaidAmount = parseFloat(loan.total_interest_paid || 0);
+      // Use actual payment amounts (gross vs net)
+      const actualPaidGross = parseFloat(loan.total_interest_paid_gross || 0);
+      const actualPaidNet = parseFloat(loan.total_interest_paid_net || 0);
+      const totalTaxPaid = parseFloat(loan.total_tax_paid || 0);
+      const totalFeesPaid = parseFloat(loan.total_fees_paid || 0);
       
       // Calculate loan term in months for spreading the income
       const loanStartDate = new Date(loan.loan_start_date);
@@ -79,15 +88,22 @@ router.get('/monthly', async (req, res) => {
       const totalDays = Math.ceil((loanEndDate - loanStartDate) / (1000 * 60 * 60 * 24));
       const approximateMonths = Math.max(1, Math.round(totalDays / 30)); // Ensure at least 1 month
       
-      // Calculate monthly income based on actual payments
-      const monthlyIncomeFromActualPayments = actualPaidAmount / approximateMonths;
+      // Calculate monthly income based on NET payments (actual cash received)
+      const monthlyIncomeFromActualPayments = actualPaidNet / approximateMonths;
+      const monthlyTaxFromActualPayments = totalTaxPaid / approximateMonths;
+      const monthlyFeesFromActualPayments = totalFeesPaid / approximateMonths;
       
       return {
         ...loan,
         expectedInterest: expectedInterest.totalInterest,
-        actualPaidAmount,
+        actualPaidGross,
+        actualPaidNet,
+        totalTaxPaid,
+        totalFeesPaid,
         approximateMonths,
         monthlyIncomeFromActualPayments,
+        monthlyTaxFromActualPayments,
+        monthlyFeesFromActualPayments,
         loanStartDate,
         loanEndDate,
         contractPeriod: expectedInterest.period
@@ -95,7 +111,10 @@ router.get('/monthly', async (req, res) => {
     });
 
     console.log(`📊 Processing ${loanData.length} loans with actual payment data`);
-    console.log(`💰 Total actual interest collected: $${loanData.reduce((sum, l) => sum + l.actualPaidAmount, 0).toFixed(2)}`);
+    console.log(`💰 Total actual interest collected (GROSS): $${loanData.reduce((sum, l) => sum + l.actualPaidGross, 0).toFixed(2)}`);
+    console.log(`💰 Total actual interest collected (NET): $${loanData.reduce((sum, l) => sum + l.actualPaidNet, 0).toFixed(2)}`);
+    console.log(`💸 Total taxes paid: $${loanData.reduce((sum, l) => sum + l.totalTaxPaid, 0).toFixed(2)}`);
+    console.log(`💸 Total fees paid: $${loanData.reduce((sum, l) => sum + l.totalFeesPaid, 0).toFixed(2)}`);
     console.log(`📈 Total expected interest: $${loanData.reduce((sum, l) => sum + l.expectedInterest, 0).toFixed(2)}`);
 
     // Generate monthly predictions
@@ -109,6 +128,8 @@ router.get('/monthly', async (req, res) => {
         month: targetDate.toISOString().slice(0, 7), // YYYY-MM format
         monthName: targetDate.toLocaleDateString('en-US', { month: 'long', year: 'numeric' }),
         totalInterestReceivable: 0,
+        totalTaxes: 0,
+        totalFees: 0,
         totalPrincipalDue: 0,
         totalCashInflow: 0,
         totalInvestorPayouts: 0,
@@ -123,16 +144,24 @@ router.get('/monthly', async (req, res) => {
         // Check if loan is active during this month
         if (loan.loanStartDate <= monthEnd && loan.loanEndDate >= monthStart) {
           // Only include income if borrower actually made payments
-          if (loan.actualPaidAmount > 0) {
+          if (loan.actualPaidNet > 0) {
             monthData.totalInterestReceivable += loan.monthlyIncomeFromActualPayments;
+            monthData.totalTaxes += loan.monthlyTaxFromActualPayments;
+            monthData.totalFees += loan.monthlyFeesFromActualPayments;
             monthData.interestPayments.push({
               stageId: loan.id,
               projectTitle: loan.project_title,
-              amount: loan.monthlyIncomeFromActualPayments,
+              netAmount: loan.monthlyIncomeFromActualPayments,
+              grossAmount: loan.actualPaidGross / loan.approximateMonths,
+              taxAmount: loan.monthlyTaxFromActualPayments,
+              feeAmount: loan.monthlyFeesFromActualPayments,
               type: 'actual_monthly_income',
-              actualPaid: loan.actualPaidAmount,
+              actualPaidGross: loan.actualPaidGross,
+              actualPaidNet: loan.actualPaidNet,
+              totalTaxes: loan.totalTaxPaid,
+              totalFees: loan.totalFeesPaid,
               expectedTotal: loan.expectedInterest,
-              paymentStatus: loan.actualPaidAmount >= loan.expectedInterest * 0.99 ? 'fully_paid' : 'partial_paid'
+              paymentStatus: loan.actualPaidNet >= loan.expectedInterest * 0.99 ? 'fully_paid' : 'partial_paid'
             });
           }
         }
@@ -175,6 +204,8 @@ router.get('/monthly', async (req, res) => {
       
       // Round all monetary values
       monthData.totalInterestReceivable = Math.round(monthData.totalInterestReceivable * 100) / 100;
+      monthData.totalTaxes = Math.round(monthData.totalTaxes * 100) / 100;
+      monthData.totalFees = Math.round(monthData.totalFees * 100) / 100;
       monthData.totalPrincipalDue = Math.round(monthData.totalPrincipalDue * 100) / 100;
       monthData.totalCashInflow = Math.round(monthData.totalCashInflow * 100) / 100;
       monthData.totalInvestorPayouts = Math.round(monthData.totalInvestorPayouts * 100) / 100;
@@ -188,10 +219,10 @@ router.get('/monthly', async (req, res) => {
     }
 
     // Calculate summary with actual payment statistics
-    const loansWithPayments = loanData.filter(l => l.actualPaidAmount > 0);
-    const fullyPaidLoans = loanData.filter(l => l.actualPaidAmount >= l.expectedInterest * 0.99);
-    const partiallyPaidLoans = loanData.filter(l => l.actualPaidAmount > 0 && l.actualPaidAmount < l.expectedInterest * 0.99);
-    const unpaidLoans = loanData.filter(l => l.actualPaidAmount === 0);
+    const loansWithPayments = loanData.filter(l => l.actualPaidNet > 0);
+    const fullyPaidLoans = loanData.filter(l => l.actualPaidNet >= l.expectedInterest * 0.99);
+    const partiallyPaidLoans = loanData.filter(l => l.actualPaidNet > 0 && l.actualPaidNet < l.expectedInterest * 0.99);
+    const unpaidLoans = loanData.filter(l => l.actualPaidNet === 0);
 
     const summary = {
       totalInflows: Math.round(totalInflows * 100) / 100,
@@ -206,10 +237,16 @@ router.get('/monthly', async (req, res) => {
         fullyPaidLoans: fullyPaidLoans.length,
         partiallyPaidLoans: partiallyPaidLoans.length,
         unpaidLoans: unpaidLoans.length,
-        totalActualPayments: Math.round(loanData.reduce((sum, l) => sum + l.actualPaidAmount, 0) * 100) / 100,
+        totalActualPaymentsGross: Math.round(loanData.reduce((sum, l) => sum + l.actualPaidGross, 0) * 100) / 100,
+        totalActualPaymentsNet: Math.round(loanData.reduce((sum, l) => sum + l.actualPaidNet, 0) * 100) / 100,
+        totalTaxesPaid: Math.round(loanData.reduce((sum, l) => sum + l.totalTaxPaid, 0) * 100) / 100,
+        totalFeesPaid: Math.round(loanData.reduce((sum, l) => sum + l.totalFeesPaid, 0) * 100) / 100,
         totalExpectedPayments: Math.round(loanData.reduce((sum, l) => sum + l.expectedInterest, 0) * 100) / 100,
-        collectionRate: loanData.reduce((sum, l) => sum + l.expectedInterest, 0) > 0 ? 
-          Math.round((loanData.reduce((sum, l) => sum + l.actualPaidAmount, 0) / 
+        collectionRateGross: loanData.reduce((sum, l) => sum + l.expectedInterest, 0) > 0 ? 
+          Math.round((loanData.reduce((sum, l) => sum + l.actualPaidGross, 0) / 
+                     loanData.reduce((sum, l) => sum + l.expectedInterest, 0)) * 10000) / 100 : 0,
+        collectionRateNet: loanData.reduce((sum, l) => sum + l.expectedInterest, 0) > 0 ? 
+          Math.round((loanData.reduce((sum, l) => sum + l.actualPaidNet, 0) / 
                      loanData.reduce((sum, l) => sum + l.expectedInterest, 0)) * 10000) / 100 : 0
       }
     };
@@ -220,7 +257,8 @@ router.get('/monthly', async (req, res) => {
     console.log(`📊 NET Cashflow: $${summary.totalNetCashflow.toFixed(2)}`);
     console.log(`📈 Payment Analysis:`);
     console.log(`   - Loans with payments: ${summary.paymentAnalysis.loansWithPayments}/${summary.paymentAnalysis.totalLoans}`);
-    console.log(`   - Collection rate: ${summary.paymentAnalysis.collectionRate}%`);
+    console.log(`   - Collection rate (Gross): ${summary.paymentAnalysis.collectionRateGross}%`);
+    console.log(`   - Collection rate (Net): ${summary.paymentAnalysis.collectionRateNet}%`);
 
     res.json({
       success: true,
