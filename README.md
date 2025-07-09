@@ -1,12 +1,16 @@
 # ⚠️ IMPORTANT NOTES
 
-## 1. 数据库说明
+## 1. 使用说明-数据库说明
 
 - 所有数据库相关文件都位于 `database/` 目录中。
 - `schema.sql` 是清洗过脏数据之后的数据库结构与数据。
 - `goodland_2025-06-30_02-30-02_mysql_data.sql` 是原始数据库数据，需要在本地 MySQL Workbench 中导入使用。
 
-## 2. Cashflow Prediction 说明
+## 2. 使用说明-前端说明
+- 运行前端之前请运行：npm install安装相关插件。
+
+
+## 3. Cashflow Prediction 说明
 
 - 所有与现金流预测相关的计算逻辑和说明文档请见：
   - `backend/CASHFLOW_PREDICTION_README.md`
