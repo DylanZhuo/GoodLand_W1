@@ -1,3 +1,51 @@
+# ⚠️ IMPORTANT NOTES
+
+## 1. 数据库说明
+
+- 所有数据库相关文件都位于 `database/` 目录中。
+- `schema.sql` 是清洗过脏数据之后的数据库结构与数据。
+- `goodland_2025-06-30_02-30-02_mysql_data.sql` 是原始数据库数据，需要在本地 MySQL Workbench 中导入使用。
+
+## 2. Cashflow Prediction 说明
+
+- 所有与现金流预测相关的计算逻辑和说明文档请见：
+  - `backend/CASHFLOW_PREDICTION_README.md`
+
+---
+
+# 🛠️ 后续改进建议
+
+### 1. CashFlow Prediction 计算公式
+
+- 具体的公式已在下方展示，公式按照对公司业务理解梳理，如果有逻辑错误，后续修改。
+-  `backend/CASHFLOW_PREDICTION_README.md`
+
+### 2. 脏数据 - 重复项与异常值
+
+- 存在及其异常的数据，会严重影响cashflow计算，所以可能显示数字有误。
+- 数据库中存在重复的项目信息记录和异常的利息支付数据。
+- 某些贷款可能会以不同金额或支付状态重复出现。
+- 系统日志会记录重复的项目名称和异常的支付完成百分比。
+
+### 3. 电子邮件和电话信息缺失
+
+- 许多投资者记录缺少电子邮件地址和电话号码。
+- 付款提醒系统无法向所有投资者发送通知。
+- `/api/reminders/investors` 返回的联系信息不完整。
+- 系统仍然生成提醒，但会标记为“联系信息不可用”。
+
+### 4. 状态分类错误
+
+- 有 3 条以上的贷款记录由于状态逻辑冲突被误判为“逾期”。
+- “operating”状态的过滤逻辑在某些边缘情况中失效。
+- 导致贷款状态报告和现金流预测出现误报。
+
+
+---
+
+
+
+
 # Goodland LMS - Loan Management System
 
 A comprehensive loan management system for tracking loans, investor payments, and cashflow predictions with React frontend and Node.js backend.
